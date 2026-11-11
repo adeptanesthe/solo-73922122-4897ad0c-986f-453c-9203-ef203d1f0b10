@@ -1,0 +1,19 @@
+{
+  "policy": {
+    "ProtectSystem": "full",
+    "ProtectHome": "read-only",
+    "ReadWritePaths": ["/etc/app", "/var/lib/app"],
+    "InaccessiblePaths": ["/etc/secret"],
+    "PrivateTmp": true,
+    "UnitName": "app.service"
+  },
+  "events": [
+    {"type": "chdir", "pid": 100, "path": "/var/lib/app"},
+    {"type": "fork", "pid": 100, "child_pid": 101, "ppid": 100},
+    {"type": "access", "pid": 101, "operation": "write", "path": "state.db"},
+    {"type": "access", "pid": 100, "operation": "write", "path": "/tmp/cache/idx"},
+    {"type": "access", "pid": 100, "operation": "write", "path": "/etc/app/config.ini"},
+    {"type": "chdir", "pid": 100, "path": "/usr/local"},
+    {"type": "access", "pid": 100, "operation": "write", "path": "../lib/evil.so"}
+  ]
+}

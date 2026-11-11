@@ -1,0 +1,25 @@
+services:
+  sandbox-checker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: systemd-sandbox-checker:1.0.0
+    container_name: systemd-sandbox-checker
+    ports:
+      # 宿主机 8080 -> 容器 8080；如端口冲突可修改左侧
+      - "8080:8080"
+    restart: unless-stopped
+    # 纯计算服务：只读根文件系统、无特权、不挂主机目录
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=16m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
