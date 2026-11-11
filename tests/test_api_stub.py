@@ -104,6 +104,17 @@ class HTTPException(Exception):
         self.detail = detail
 
 
+class UploadFile:
+    """最小 UploadFile stub：只需暴露二进制 file 对象。"""
+
+    def __init__(self, file):
+        self.file = file
+
+
+def File(default=None, **kw):  # noqa: N802
+    return default
+
+
 class _Route:
     def __init__(self, path, method, fn):
         self.path = path
@@ -132,6 +143,8 @@ class _FastAPI:
 fastapi = types.ModuleType("fastapi")
 fastapi.FastAPI = _FastAPI
 fastapi.HTTPException = HTTPException
+fastapi.UploadFile = UploadFile
+fastapi.File = File
 sys.modules["fastapi"] = fastapi
 
 responses = types.ModuleType("fastapi.responses")
@@ -142,7 +155,17 @@ class RedirectResponse:
         self.url = url
 
 
+class StreamingResponse:
+    def __init__(self, content, status_code=200, headers=None, media_type=None, background=None):
+        self.body_iterator = content
+        self.status_code = status_code
+        self.headers = headers
+        self.media_type = media_type
+        self.background = background
+
+
 responses.RedirectResponse = RedirectResponse
+responses.StreamingResponse = StreamingResponse
 sys.modules["fastapi.responses"] = responses
 
 
@@ -157,7 +180,8 @@ from app.schemas import (  # noqa: E402
     TraceEntry,
     EffectivePolicy,
 )
-from app.main import app, evaluate_events  # noqa: E402
+from app.main import app, evaluate_events, evaluate_file  # noqa: E402
+from app import main as main_module  # noqa: E402
 from fastapi import HTTPException as RealHTTPException  # noqa: E402
 
 
@@ -191,6 +215,7 @@ def check(name, cond, detail=""):
 print("test_app_wiring")
 paths = {(r.method, r.path) for r in app.routes}
 check("注册了评估端点", ("POST", "/api/v1/evaluate") in paths)
+check("注册了文件上传端点", ("POST", "/api/v1/evaluate/file") in paths)
 check("注册了健康检查", ("GET", "/health") in paths)
 check("根路径重定向已注册", ("GET", "/") in paths)
 
@@ -253,6 +278,100 @@ try:
     check("缺 child_pid 报 422", False, "未抛异常")
 except RealHTTPException as exc:
     check("缺 child_pid 报 422", exc.status_code == 422)
+
+print("test_file_upload_streaming")
+import asyncio  # noqa: E402
+import gzip  # noqa: E402
+import io  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import tempfile  # noqa: E402
+
+from fastapi import UploadFile as StubUploadFile  # noqa: E402
+
+
+def _consume(response) -> bytes:
+    async def collect() -> bytes:
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    return asyncio.run(collect())
+
+
+_policy = {"ProtectSystem": "full", "ReadWritePaths": ["/var/lib/app"]}
+_events = [
+    {"type": "chdir", "pid": 7, "path": "/var/lib/app"},
+    {"type": "fork", "pid": 7, "child_pid": 8, "ppid": 7},
+    {"type": "access", "pid": 8, "operation": "write", "path": "state.db"},
+    {"type": "access", "pid": 7, "operation": "write", "path": "/usr/lib/evil.so"},
+    {"type": "access", "pid": 8, "operation": "write", "path": "/tmp/later"},
+]
+_lines = [{"policy": _policy}] + _events
+_raw = ("\n".join(json.dumps(x, ensure_ascii=False) for x in _lines) + "\n").encode("utf-8")
+_gz = gzip.compress(_raw, mtime=0)
+
+_holder = tempfile.mkdtemp(prefix="stub-upload-")
+_original_mkdtemp = main_module.tempfile.mkdtemp
+main_module.tempfile.mkdtemp = lambda **kw: _holder
+try:
+    _response = evaluate_file(StubUploadFile(io.BytesIO(_gz)))
+    _body = _consume(_response)
+finally:
+    main_module.tempfile.mkdtemp = _original_mkdtemp
+
+_result = json.loads(_body)
+check("文件接口返回原 JSON 字段", set(_result) == {
+    "allowed", "failure_event_seq", "failure_reason",
+    "events_total", "events_evaluated", "policy_effective", "trace",
+})
+check("events_total 计全部事件", _result["events_total"] == 5)
+check("首个拒绝后停止判定", _result["events_evaluated"] == 4)
+check("轨迹只含已判定事件", len(_result["trace"]) == 4)
+check("fork 后相对路径仍正确", _result["trace"][2]["normalized_path"] == "/var/lib/app/state.db")
+check("下载结束后清理临时资源", not os.path.exists(_holder))
+
+print("test_file_upload_422_and_cleanup")
+_bad_holder = tempfile.mkdtemp(prefix="stub-upload-bad-")
+main_module.tempfile.mkdtemp = lambda **kw: _bad_holder
+try:
+    try:
+        evaluate_file(StubUploadFile(io.BytesIO(b"not a gzip stream")))
+        check("损坏压缩流报 422", False, "未抛异常")
+    except RealHTTPException as exc:
+        check("损坏压缩流报 422", exc.status_code == 422 and "损坏" in exc.detail)
+    check("处理失败后清理临时资源", not os.path.exists(_bad_holder))
+finally:
+    main_module.tempfile.mkdtemp = _original_mkdtemp
+
+_bad_line = gzip.compress(
+    (json.dumps({"policy": _policy}) + "\n"
+     + json.dumps({"type": "access", "pid": 1, "operation": "read", "path": "/ok"}) + "\n"
+     + json.dumps({"type": "fork", "pid": 1}) + "\n").encode("utf-8"),
+    mtime=0,
+)
+try:
+    evaluate_file(StubUploadFile(io.BytesIO(_bad_line)))
+    check("坏行报 422", False, "未抛异常")
+except RealHTTPException as exc:
+    check("坏行报 422 并给出行号", exc.status_code == 422 and "第 3 行" in exc.detail)
+
+print("test_file_upload_disconnect_cleanup")
+_disconnect_holder = tempfile.mkdtemp(prefix="stub-upload-disconnect-")
+main_module.tempfile.mkdtemp = lambda **kw: _disconnect_holder
+try:
+    _disconnect_response = evaluate_file(StubUploadFile(io.BytesIO(_gz)))
+
+    async def _read_one_then_close():
+        iterator = _disconnect_response.body_iterator
+        await iterator.__anext__()
+        await iterator.aclose()
+
+    asyncio.run(_read_one_then_close())
+    check("断连后清理临时资源", not os.path.exists(_disconnect_holder))
+finally:
+    main_module.tempfile.mkdtemp = _original_mkdtemp
 
 print()
 if failures:

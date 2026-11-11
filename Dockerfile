@@ -12,6 +12,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+# /docs 页面通过相对路径 examples/audit-upload.jsonl.gz 提供上传样例
+COPY examples ./examples
 
 # 以非 root 运行（该服务本身不需要任何特权，只做纯计算）
 RUN useradd --create-home --uid 10001 appuser

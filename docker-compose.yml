@@ -15,11 +15,18 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    tmpfs:
-      - /tmp:size=16m
+    # 解压后的事件与轨迹落在磁盘临时目录；/tmp 单独挂载为可写卷，
+    # 容器根文件系统仍保持只读。
+    volumes:
+      - checker-tmp:/tmp
+    environment:
+      SANDBOX_CHECKER_TMPDIR: /tmp
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 5s
+
+volumes:
+  checker-tmp:

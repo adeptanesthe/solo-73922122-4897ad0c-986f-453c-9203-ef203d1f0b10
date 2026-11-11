@@ -35,14 +35,19 @@
 
 ```
 app/
-  engine.py    # 纯标准库判定引擎（路径规范化、cwd 继承、策略匹配）
+  engine.py    # 纯标准库判定引擎（路径规范化、cwd 继承、策略匹配、流式判定器）
+  file_eval.py # gzip JSONL 流式校验/判定/响应（临时文件，不整体载入内存）
   schemas.py   # pydantic v2 请求/响应模型（兼容 systemd 原生字段名与 snake_case）
-  main.py      # FastAPI 应用：/docs、/health、/api/v1/evaluate
+  main.py      # FastAPI 应用：/docs、/health、/api/v1/evaluate、文件上传
   cli.py       # 离线命令行入口（无需 FastAPI）
 tests/
-  test_engine.py   # 引擎测试，python3 -I 直接运行
-  test_api_stub.py # 无 FastAPI 环境下的 API 接线测试（内置最小 stub）
-examples/request.json
+  test_engine.py    # 引擎测试，python3 -I 直接运行
+  test_file_eval.py # gzip 上传链路的格式/限制/停止语义/损坏流测试
+  test_api_stub.py  # 无 FastAPI 环境下的 API 接线与流式响应测试
+examples/
+  request.json          # 原 JSON 接口样例
+  audit-upload.jsonl    # 文件接口的可读 JSONL 样例（fork 后相对路径）
+  audit-upload.jsonl.gz # /docs 页面通过相对路径提供的 gzip 上传样例
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -52,15 +57,25 @@ requirements.txt
 
 ```bash
 docker compose up --build -d
-# 交互式文档（可直接在页面上发请求）
+# 交互式文档（可直接在页面上发请求；页面内提供相对路径的上传样例）
 xdg-open http://localhost:8080/docs      # Linux 桌面
 # 健康检查
 curl -s http://localhost:8080/health
-# 命令行调用
+# 命令行调用原 JSON 接口
 curl -s -X POST http://localhost:8080/api/v1/evaluate \
   -H 'Content-Type: application/json' \
   --data @examples/request.json | jq .
+# 命令行演示 gzip 文件核对（样例见 /docs 页面）
+curl -s -X POST http://localhost:8080/api/v1/evaluate/file \
+  -F 'file=@examples/audit-upload.jsonl.gz' | jq .
 ```
+
+文件上传样例在 /docs 页面以相对路径 `examples/audit-upload.jsonl.gz` 提供，
+直接点击即可下载；容器内的临时轨迹写入 `/tmp`（Compose 中为可写卷），
+根文件系统仍保持只读。样例含 `chdir`、`fork` 后的相对路径访问，并在第 6 个
+事件被 `ProtectSystem=full` 拒绝；因此演示结果应为
+`allowed=false`、`failure_event_seq=6`、`events_total=8`、`events_evaluated=6`，
+而第 7、8 个事件虽不再判定，仍会完成格式与 gzip 尾部校验。
 
 容器以非 root 运行，带 `read_only` 根文件系统、`no-new-privileges`、drop 全部 capabilities，
 自身就是一个加固过的沙箱化服务。端口冲突时修改 `docker-compose.yml` 左侧端口即可。
@@ -117,6 +132,46 @@ cat examples/request.json | python3 -I app/cli.py -
 - `chdir`：带 `path`（绝对或相对），按目录搜索权限判定，成功后更新该 PID 的 cwd。
 - `access`：必须带 `operation`（`read`/`write`/`execute`）与 `path`。
 
+## gzip 文件上传接口
+
+整日审计事件较多时，不必把所有事件塞进一个 JSON 请求体。两个 POST 端点
+（`/api/v1/evaluate/file` 为主，`/api/v1/evaluate/gzip`、`/api/v1/evaluate/upload`
+为等价别名）接受 multipart 文件字段 `file`：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/evaluate/file \
+  -F 'file=@examples/audit-upload.jsonl.gz' | jq .
+```
+
+文件为 **gzip 压缩的 UTF-8 JSONL**，上传时不需要先解压：
+
+- 解压后的**第 1 行**只允许包含 `policy`：`{"policy": {...}}`，不能再带 `events`；
+- 后续**每行一个**与原 JSON 接口相同格式的事件（`fork` / `chdir` / `access`）；
+- 最多 **200000 个事件**；
+- 事件中出现的不同 PID（`pid` 与 `child_pid`）最多 **256 个**；
+- 解压后**每行最多 4096 字节**（不计行尾换行）。
+
+判定仍沿用原策略与 cwd 继承语义：相对路径按进程当前 cwd 拼接，`fork` 子进程
+继承父进程 cwd，遇**首个拒绝即停止判定**。响应字段与轨迹结构与原接口完全一致：
+
+- `events_total` 统计文件中的**全部**事件；
+- `events_evaluated` / `trace` 只到首个拒绝（含该事件）为止；
+- 停止判定后仍会继续检查**后续每一行**的 JSON 格式与必需字段，并读完整个
+  gzip 流验证尾部（CRC/截断）。
+
+错误处理：坏行、超出限制、不是合法 UTF-8、gzip 损坏或截断都会返回 **422**，
+`detail` 中给出解压后的**物理行号**（首行 policy 为第 1 行），此时**不返回**
+任何核对结果。例如：
+
+```json
+{"detail": "第 3 行（第 2 个事件）：fork 事件缺少合法的 child_pid"}
+```
+
+资源与清理：上传、解压、判定和响应全程**不把文件、事件列表或轨迹整体放入
+内存**，内存占用不随事件数增长；判定轨迹写入本请求专属的磁盘临时文件，
+响应按轨迹文件分块输出。上传中断、处理失败、下载完成或客户端断连时，
+都会删除该请求的临时目录。容器场景可用 `SANDBOX_CHECKER_TMPDIR` 指定临时根目录。
+
 ## 响应解读（节选）
 
 ```json
@@ -155,7 +210,8 @@ cat examples/request.json | python3 -I app/cli.py -
 
 ```bash
 python3 -I tests/test_engine.py     # 11 组引擎语义测试，无需第三方依赖
-python3 -I tests/test_api_stub.py   # 无 FastAPI 环境下的端点/别名/422 接线测试
+python3 -I tests/test_file_eval.py  # gzip 校验/限制/停止后尾部检查/损坏流测试
+python3 -I tests/test_api_stub.py   # 无 FastAPI 环境下的端点/别名/422/流式响应接线测试
 ```
 
 ## 建模边界（与真实 systemd 的差异）

@@ -279,6 +279,31 @@ def check_access(
 # --------------------------------------------------------------------------- #
 # 事件流评估
 # --------------------------------------------------------------------------- #
+def normalize_policy(policy: dict) -> dict:
+    """把请求中的策略归一化为引擎内部 cfg；非法配置抛 PolicyError。"""
+    if not isinstance(policy, dict):
+        raise PolicyError("policy 必须是 JSON 对象")
+    return {
+        "protect_system": _norm_system(_first(policy, "ProtectSystem", "protect_system")),
+        "protect_home": _norm_home(_first(policy, "ProtectHome", "protect_home")),
+        "read_write_paths": _norm_path_list(
+            _first(policy, "ReadWritePaths", "read_write_paths", default=[]),
+            "ReadWritePaths",
+        ),
+        "inaccessible_paths": _norm_path_list(
+            _first(policy, "InaccessiblePaths", "inaccessible_paths", default=[]),
+            "InaccessiblePaths",
+        ),
+        "private_tmp": _norm_bool(_first(policy, "PrivateTmp", "private_tmp", default=False)),
+        "unit_name": str(_first(policy, "unit_name", "UnitName", default="daemon.service")),
+    }
+
+
+def policy_summary(cfg: dict) -> dict:
+    """公开的策略回显，供流式接口复用。"""
+    return _policy_summary(cfg)
+
+
 def _base_trace(event: dict, seq: int, cwd_before: str) -> dict:
     return {
         "seq": event.get("seq", seq),
@@ -298,6 +323,92 @@ def _base_trace(event: dict, seq: int, cwd_before: str) -> dict:
     }
 
 
+class EventEvaluator:
+    """有状态的流式事件判定器。
+
+    只保存每个 PID 的当前工作目录（调用方需保证 PID 数量有界）；
+    每次 ``feed`` 处理一个事件并返回对应轨迹条目，不累积历史轨迹，
+    因此内存占用不随事件总数增长。
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.cwd_table: dict[int, str] = {}
+        self.evaluated = 0
+        self.failure: dict | None = None
+
+    def feed(self, event: dict, seq: int) -> dict:
+        """处理一个事件；遇首个拒绝时记录到 ``self.failure`` 并返回该轨迹。"""
+        if not isinstance(event, dict):
+            raise PolicyError(f"第 {seq} 个事件必须是 JSON 对象")
+        etype = event.get("type")
+        pid = event.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise PolicyError(f"第 {seq} 个事件缺少合法的 pid")
+        cwd_before = self.cwd_table.get(pid, "/")
+        entry = _base_trace(event, seq, cwd_before)
+        self.evaluated += 1
+
+        # -- fork：子进程继承父进程 cwd -----------------------------------
+        if etype == "fork":
+            child = event.get("child_pid")
+            if not isinstance(child, int) or child <= 0:
+                raise PolicyError(f"第 {seq} 个 fork 事件缺少合法的 child_pid")
+            self.cwd_table[child] = cwd_before
+            entry["cwd_after"] = cwd_before
+            entry["decision"] = DECISION_INFO
+            entry["reason"] = (
+                f"进程 {pid} 派生子进程 {child}，子进程继承工作目录 {cwd_before}"
+            )
+            entry["notes"].append("fork 不触发文件访问策略判定，仅传递 cwd 状态")
+            return entry
+
+        if etype not in ("chdir", "access"):
+            raise PolicyError(
+                f"第 {seq} 个事件 type 必须是 fork/chdir/access，收到 {etype!r}"
+            )
+        raw_path = event.get("path")
+        host_path = resolve_path(raw_path if isinstance(raw_path, str) else "", cwd_before)
+        entry["normalized_path"] = host_path
+
+        # -- chdir：需要目录的搜索（execute）权限，成功后更新 cwd ----------
+        if etype == "chdir":
+            result = check_access(host_path, "execute", self.cfg)
+            entry["sandbox_path"] = result["sandbox_path"]
+            entry["matched_policies"] = result["matched_policies"]
+            entry["notes"] = result["notes"]
+            if result["decision"] == DECISION_DENY:
+                entry["decision"] = DECISION_DENY
+                entry["reason"] = f"切换工作目录被拒绝：{result['reason']}"
+                self.failure = entry
+                return entry
+            self.cwd_table[pid] = host_path
+            entry["cwd_after"] = host_path
+            entry["decision"] = DECISION_ALLOW
+            entry["reason"] = (
+                f"chdir 解析：{raw_path!r}（相对 {cwd_before}）-> {host_path}，"
+                "目录可搜索，工作目录已更新"
+            )
+            return entry
+
+        # -- access：read / write / execute -------------------------------
+        operation = event.get("operation")
+        if operation not in ("read", "write", "execute"):
+            raise PolicyError(
+                f"第 {seq} 个 access 事件的 operation 必须是 read/write/execute"
+            )
+        result = check_access(host_path, operation, self.cfg)
+        entry["sandbox_path"] = result["sandbox_path"]
+        entry["matched_policies"] = result["matched_policies"]
+        entry["notes"] = result["notes"]
+        entry["decision"] = result["decision"]
+        entry["reason"] = result["reason"]
+        entry["cwd_after"] = cwd_before
+        if result["decision"] == DECISION_DENY:
+            self.failure = entry
+        return entry
+
+
 def evaluate(policy: dict, events: list[dict]) -> dict:
     """按时间顺序回放审计事件，逐步判定，遇首个失败即停止。
 
@@ -307,95 +418,16 @@ def evaluate(policy: dict, events: list[dict]) -> dict:
         raise PolicyError("policy 必须是 JSON 对象")
     if not isinstance(events, list):
         raise PolicyError("events 必须是数组")
+    cfg = normalize_policy(policy)
 
-    cfg = {
-        "protect_system": _norm_system(_first(policy, "ProtectSystem", "protect_system")),
-        "protect_home": _norm_home(_first(policy, "ProtectHome", "protect_home")),
-        "read_write_paths": _norm_path_list(
-            _first(policy, "ReadWritePaths", "read_write_paths", default=[]),
-            "ReadWritePaths",
-        ),
-        "inaccessible_paths": _norm_path_list(
-            _first(policy, "InaccessiblePaths", "inaccessible_paths", default=[]),
-            "InaccessiblePaths",
-        ),
-        "private_tmp": _norm_bool(_first(policy, "PrivateTmp", "private_tmp", default=False)),
-        "unit_name": str(_first(policy, "unit_name", "UnitName", default="daemon.service")),
-    }
-
+    evaluator = EventEvaluator(cfg)
     trace: list[dict] = []
-    cwd_table: dict[int, str] = {}
     total = len(events)
 
     for idx, event in enumerate(events, start=1):
-        if not isinstance(event, dict):
-            raise PolicyError(f"第 {idx} 个事件必须是 JSON 对象")
-        etype = event.get("type")
-        pid = event.get("pid")
-        if not isinstance(pid, int) or pid <= 0:
-            raise PolicyError(f"第 {idx} 个事件缺少合法的 pid")
-        cwd_before = cwd_table.get(pid, "/")
-        entry = _base_trace(event, idx, cwd_before)
-
-        # -- fork：子进程继承父进程 cwd -----------------------------------
-        if etype == "fork":
-            child = event.get("child_pid")
-            if not isinstance(child, int) or child <= 0:
-                raise PolicyError(f"第 {idx} 个 fork 事件缺少合法的 child_pid")
-            cwd_table[child] = cwd_before
-            entry["cwd_after"] = cwd_before
-            entry["decision"] = DECISION_INFO
-            entry["reason"] = (
-                f"进程 {pid} 派生子进程 {child}，子进程继承工作目录 {cwd_before}"
-            )
-            entry["notes"].append("fork 不触发文件访问策略判定，仅传递 cwd 状态")
-            trace.append(entry)
-            continue
-
-        if etype not in ("chdir", "access"):
-            raise PolicyError(
-                f"第 {idx} 个事件 type 必须是 fork/chdir/access，收到 {etype!r}"
-            )
-        raw_path = event.get("path")
-        host_path = resolve_path(raw_path if isinstance(raw_path, str) else "", cwd_before)
-        entry["normalized_path"] = host_path
-
-        # -- chdir：需要目录的搜索（execute）权限，成功后更新 cwd ----------
-        if etype == "chdir":
-            result = check_access(host_path, "execute", cfg)
-            entry["sandbox_path"] = result["sandbox_path"]
-            entry["matched_policies"] = result["matched_policies"]
-            entry["notes"] = result["notes"]
-            if result["decision"] == DECISION_DENY:
-                entry["decision"] = DECISION_DENY
-                entry["reason"] = f"切换工作目录被拒绝：{result['reason']}"
-                trace.append(entry)
-                return _fail_response(cfg, trace, entry, total)
-            cwd_table[pid] = host_path
-            entry["cwd_after"] = host_path
-            entry["decision"] = DECISION_ALLOW
-            entry["reason"] = (
-                f"chdir 解析：{raw_path!r}（相对 {cwd_before}）-> {host_path}，"
-                "目录可搜索，工作目录已更新"
-            )
-            trace.append(entry)
-            continue
-
-        # -- access：read / write / execute -------------------------------
-        operation = event.get("operation")
-        if operation not in ("read", "write", "execute"):
-            raise PolicyError(
-                f"第 {idx} 个 access 事件的 operation 必须是 read/write/execute"
-            )
-        result = check_access(host_path, operation, cfg)
-        entry["sandbox_path"] = result["sandbox_path"]
-        entry["matched_policies"] = result["matched_policies"]
-        entry["notes"] = result["notes"]
-        entry["decision"] = result["decision"]
-        entry["reason"] = result["reason"]
-        entry["cwd_after"] = cwd_before
+        entry = evaluator.feed(event, idx)
         trace.append(entry)
-        if result["decision"] == DECISION_DENY:
+        if evaluator.failure is not None:
             return _fail_response(cfg, trace, entry, total)
 
     return {
@@ -403,10 +435,11 @@ def evaluate(policy: dict, events: list[dict]) -> dict:
         "failure_event_seq": None,
         "failure_reason": None,
         "events_total": total,
-        "events_evaluated": len(trace),
+        "events_evaluated": evaluator.evaluated,
         "policy_effective": _policy_summary(cfg),
         "trace": trace,
     }
+
 
 
 def _fail_response(cfg: dict, trace: list[dict], entry: dict, total: int) -> dict:
